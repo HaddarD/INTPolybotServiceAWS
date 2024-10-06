@@ -171,8 +171,7 @@ class Bot:
                     self.send_text(chat_id, "Your image is being processed. Please wait...")
                     image_path = os.path.abspath(self.image_path)
                     image_name = os.path.basename(self.image_path)
-                    job_id = str(uuid.uuid4())  # Unique Job ID
-                    detection_result, status_code = img.upload_and_detect(image_path, image_name, job_id, chat_id)
+                    detection_result, status_code = img.upload_and_detect(image_path, image_name, chat_id)
                     logger.info(f"Detection result: {detection_result}, status code: {status_code}")
                     # if isinstance(detection_result, tuple) and len(detection_result) == 2:
                     #     detection_summary, status_code = detection_result

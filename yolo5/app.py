@@ -46,13 +46,14 @@ def convert_decimal_to_float(data: Any) -> Any:
     return data
 
 
-def process_message(message):
-    body = json.loads(message['Body'])
-    job_id = body['JobID']
-    img_name = os.path.basename(body['image_path'])
+def process_message(response):
+    prediction_id = response['Messages'][0]['MessageId']
+    body = json.loads(response['Messages'][0]['Body'])
+    receipt_handle = response['Messages'][0]['ReceiptHandle']
+    img_name = body['image_name']
     chat_id = body['chat_id']
-    receipt_handle = message['ReceiptHandle']
-    logger.info(f'Processing job: {job_id} for image: {img_name}')
+
+    logger.info(f'Processing: {chat_id} for image: {img_name}')
     try:
         user_img_path = Path(f'images/{img_name}')
         download_from_s3(img_name, str(user_img_path))
@@ -61,13 +62,13 @@ def process_message(message):
             data='data/coco128.yaml',
             source=str(user_img_path),
             project='static/data',
-            name=job_id,
+            name=prediction_id,
             save_txt=True
         )
-        detection_img_path = Path(f'static/data/{job_id}/{img_name}')
-        processed_img_name = f'{job_id}_{img_name}'
+        detection_img_path = Path(f'static/data/{prediction_id}/{img_name}')
+        processed_img_name = f'{prediction_id}_{img_name}'
         detection_image_url = upload_to_s3(str(detection_img_path), processed_img_name)
-        detect_summary_path = Path(f'static/data/{job_id}/labels/{img_name.split(".")[0]}.txt')
+        detect_summary_path = Path(f'static/data/{prediction_id}/labels/{img_name.split(".")[0]}.txt')
         with open(detect_summary_path) as f:
             labels = f.read().splitlines()
             labels = [line.split(' ') for line in labels]
@@ -78,34 +79,34 @@ def process_message(message):
                 'width': Decimal(l[3]),
                 'height': Decimal(l[4]),
             } for l in labels]
+
+        # ToDo: Fix structure as per my example
+        # Look in file called: yolo_utils.py -> write_to_db
         detection_summary = {
+            'prediction_id': str(prediction_id),
             'user_img_path': str(user_img_path),
             'detection_img_path': str(detection_img_path),
             'detection_image_url': detection_image_url,
             'labels': labels
         }
-        store_detection_in_dynamodb(job_id, detection_summary)
-        notify_completion(job_id, processed_img_name, chat_id)
+        store_detection_in_dynamodb(detection_summary)
+
+        # ToDo: Before sending to result queue convert to friendly types
+        notify_completion(prediction_id, processed_img_name, chat_id)
         sqs_client.delete_message(QueueUrl=job_queue_url, ReceiptHandle=receipt_handle)
         logger.info(f'Processed and deleted message: {receipt_handle}')
     except Exception as e:
         logger.error(f"Error processing message: {e}")
-        notify_error(job_id, chat_id, str(e))
+        notify_error(prediction_id, chat_id, str(e))
         sqs_client.delete_message(QueueUrl=job_queue_url, ReceiptHandle=receipt_handle)
         logger.info(f'Deleted failed message: {receipt_handle}')
 
 
-def store_detection_in_dynamodb(job_id: str, detection_summary: Dict[str, Any]):
+def store_detection_in_dynamodb(detection_summary):
     try:
         table = dynamodb_table_name
-        item = {
-            'JobID': job_id,
-            'Timestamp': int(time.time()),
-            'DetectionSummary': detection_summary
-        }
-        response = table.put_item(Item=item)
-        json_summary = convert_decimal_to_float(detection_summary)
-        logger.info(f"Detection stored in DynamoDB: {json.dumps(json_summary)}")
+        response = table.put_item(Item=detection_summary)
+        logger.info(f"Detection stored in DynamoDB: {json.dumps(detection_summary)}")
         logger.debug(f"DynamoDB response: {response}")
     except ClientError as e:
         logger.error(f"Error writing to DynamoDB: {e}")
@@ -117,26 +118,19 @@ def store_detection_in_dynamodb(job_id: str, detection_summary: Dict[str, Any]):
         raise
 
 
-def notify_completion(job_id, processed_img_name, chat_id):
+def notify_completion(prediction_id, processed_img_name, chat_id):
     """Send completion notice to Polybot through SQS."""
     try:
         completion_message = json.dumps({
-            'JobID': job_id,
-            'bucket_name': bucket_name,
-            'image_name': processed_img_name,
+            'JobID': prediction_id,
+            'processed_img_name': processed_img_name,
             'chat_id': chat_id
         })
         sqs_client.send_message(
             QueueUrl=completion_queue_url,
-            MessageBody=completion_message,
-            MessageAttributes={
-                'JobID': {
-                    'StringValue': job_id,
-                    'DataType': 'String'
-                }
-            }
+            MessageBody=completion_message
         )
-        logger.info(f"Sent completion notice for prediction: {job_id}")
+        logger.info(f"Sent completion notice for prediction: {prediction_id}")
     except ClientError as e:
         logger.error(f"Error sending completion notice: {e}")
         raise
@@ -144,10 +138,8 @@ def notify_completion(job_id, processed_img_name, chat_id):
 def consume_queue():
     while True:
         response = sqs_client.receive_message(QueueUrl=job_queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=20)
-        if 'Messages' not in response:
-            continue
-        for message in response['Messages']:
-            process_message(message)
+        if 'Messages' in response:
+            process_message(response)
 
 
 def download_from_s3(s3_key, local_path):
@@ -174,36 +166,22 @@ def upload_to_s3(local_path, s3_key):
         logger.error(f"Error uploading file to S3: {e}")
         raise
 
-
-def notify_error(job_id, chat_id, error_message):
+def notify_error(prediction_id, chat_id, error_message):
     try:
         error_payload = json.dumps({
-            'JobID': job_id,
+            'JobID': prediction_id,
             'chat_id': chat_id,
             'status': 'error',
             'error_message': error_message
         })
         sqs_client.send_message(
             QueueUrl=completion_queue_url,
-            MessageBody=error_payload,
-            MessageAttributes={
-                'JobID': {
-                    'StringValue': job_id,
-                    'DataType': 'String'
-                },
-                'status': {
-                    'StringValue': 'error',
-                    'DataType': 'String'
-                }
-            }
+            MessageBody=error_payload
         )
-        logger.info(f"Sent error notice for job: {job_id}")
+        logger.info(f"Sent error notice for job: {prediction_id}")
     except ClientError as e:
         logger.error(f"Error sending error notice: {e}")
         raise
 
-
 if __name__ == "__main__":
     consume_queue()
-
-

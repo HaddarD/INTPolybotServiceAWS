@@ -121,12 +121,12 @@ class Img:
         for i, row in enumerate(self.data):
             self.data[i] = [0 if pixel < average else 255 for pixel in row]
 
-    def upload_and_detect(self, image_path, image_name, job_id, chat_id):
+    def upload_and_detect(self, image_path, image_name, chat_id):
         """
         Uploads the image to S3 & sends Yolo5 an SQS job request to detect the image content
         """
-        if not image_name:
-            raise ValueError("Image name is empty")
+        if not image_path:
+            raise ValueError("Image path is empty")
         try:
             self.upload_to_s3(image_path, image_name)
             logger.info(f"Successfully uploaded {image_name} to S3")
@@ -135,62 +135,46 @@ class Img:
             raise
         logger.info(f"Starting detection on image: {image_name}")
         # Send job to yolo5 via SQS
-        self.send_job_to_sqs(image_name, job_id, chat_id)
-        # Store job and user info in job_info dictionary
-        self.job_info[job_id] = {
-            "status": "processing",
-            "chat_id": chat_id,
-            "image_name": image_name
-        }
+        self.send_job_to_sqs(image_name, chat_id)
+
+        # ToDo: Alter this part to work on thread
         # Wait for results using polling mechanism
-        results = self.listen_for_completion(job_id)
+        results = self.listen_for_completion(chat_id)
         if isinstance(results, str) and "TimedOut" in results:
             return results, 500
         if not results:
             return "No detection results received.", 404
-        logger.info(f"Results received for job {job_id}: {results}")
+        logger.info(f"Results received for job {chat_id}: {results}")
         # Return the results back to bot.py for further processing
         return results, 200
 
-
-    def upload_to_s3(self, image_path, image_name=None):
-        if image_name is None:
-            image_name = os.path.basename(image_path)
+    def upload_to_s3(self, image_path, image_name):
         s3_client = boto3.client('s3')
         s3_key_with_prefix = f"user_images/{image_name}"
         try:
             s3_client.upload_file(image_path, self.bucket_name, s3_key_with_prefix)
-            image_url = f"https://{self.bucket_name}.s3.amazonaws.com/{s3_key_with_prefix}"
-            return image_url
         except ClientError as e:
             logger.error(f"Error uploading file to S3: {e}")
             raise
 
-    def send_job_to_sqs(self, image_name, job_id, chat_id):
+    def send_job_to_sqs(self, image_name, chat_id):
         message_body = json.dumps({
-            'bucket_name': self.bucket_name,
-            'image_path': f"user_images/{image_name}",
-            'JobID': job_id,
+            'image_name': image_name,
             'chat_id': chat_id
         })
         self.sqs_client.send_message(
             QueueUrl=self.job_queue_url,
-            MessageBody=message_body,
-            MessageAttributes={
-                'JobID': {
-                    'StringValue': job_id,
-                    'DataType': 'String'
-                }
-            }
+            MessageBody=message_body
         )
-        logger.info(f"Job sent to YOLO5 for detection, Job ID: {job_id}")
+        logger.info(f"Sent to YOLO5 for detection: {chat_id}")
 
-    def listen_for_completion(self, job_id):
+    def listen_for_completion(self, chat_id):
         max_attempts = 5  # Adjust as needed
         attempt = 0
+        job_id = ""
         # Poll SQS for completion messages
         while attempt < max_attempts:
-            logger.info(f"Polling for completion of job {job_id}")
+            logger.info(f"Polling for completion: {chat_id}")
             try:
                 response = self.sqs_client.receive_message(
                     QueueUrl=self.completion_queue_url,
@@ -201,51 +185,26 @@ class Img:
                 )
                 logger.debug(f"SQS Response: {response}")
                 if 'Messages' not in response or not response['Messages']:
-                    logger.info(f"No messages received for job {job_id}, continuing to poll")
+                    logger.info(f"No messages received: {chat_id}, continuing to poll")
                     attempt += 1
                     time.sleep(10)
                     continue
-                for message in response['Messages']:
-                    logger.debug(f"Processing message: {message}")
-                    if 'MessageAttributes' not in message or 'JobID' not in message['MessageAttributes']:
-                        logger.error(f"Message received without expected 'MessageAttributes' for job {job_id}")
-                        continue
-                    received_job_id = response['MessageAttributes']['JobID']['StringValue']
-                    completion_info = json.loads(response.get('Body', '{}'))
-                    logger.info(f'Completion message received: {completion_info}, JobID: {received_job_id}')
-                    if received_job_id == job_id:
-                        # Fetch results from DynamoDB using JobID
-                        results = self.fetch_results_from_dynamodb(job_id)
-                        logger.info(f"Results fetched from DynamoDB for job {job_id}: {results}")
-                        if not results:
-                            logger.warning(f"No results found in DynamoDB for job {job_id}")
-                            return {'status': 'error', 'error_message': 'No detection results found'}
-                    if completion_info.get('status') == 'error':
-                        error_message = completion_info.get('error_message', 'An unknown error occurred')
-                        logger.error(f"YOLO5 job {job_id} failed: {error_message}")
-                        return {'status': 'error', 'error_message': error_message}
-                    else:
-                        processed_image_name = completion_info.get('image_name')
-                        processed_image_path = self.download_processed_image_from_s3(
-                            self.bucket_name,
-                            processed_image_name,
-                            f"processed_{processed_image_name}"
-                        )
 
-                        results['processed_image_path'] = processed_image_path
-                        logger.info(f"Job {job_id} completed. Result: {results}")
-                        # Delete the message from the queue
-                        self.sqs_client.delete_message(
-                            QueueUrl=self.completion_queue_url,
-                            ReceiptHandle=message['ReceiptHandle']
-                        )
-                        logger.info(f"Deleted completion message for job {job_id}")
-                        # Clean up job_info
-                        if job_id in self.job_info:
-                            del self.job_info[job_id]
-                        return results  # Return the results to bot.py
-                attempt += 1
-                time.sleep(10)  # Sleep before polling again
+                body = json.loads(response['Messages'][0]['Body'])
+                receipt_handle = response['Messages'][0]['ReceiptHandle']
+                job_id = body['JobID']
+                processed_img_name = body['processed_img_name']
+                chat_id = body['chat_id']
+                results = self.fetch_results_from_dynamodb()
+
+                # ToDo: fix 'local_path'
+                processed_image_path = self.download_processed_image_from_s3(
+                    self.bucket_name,
+                    processed_image_name,
+                    local_path
+                )
+
+                return results  # Return the results to bot.py
             except Exception as e:
                 logger.error(f"Error while polling SQS: {str(e)}", exc_info=True)
 
