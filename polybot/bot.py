@@ -170,22 +170,14 @@ class Bot:
                 try:
                     self.send_text(chat_id, "Your image is being processed. Please wait...")
                     image_path = os.path.abspath(self.image_path)
-                    image_name = os.path.basename(self.image_path)
-                    job_id = str(uuid.uuid4())  # Unique Job ID
-                    detection_result, status_code = img.upload_and_detect(image_path, image_name, job_id, chat_id)
-                    logger.info(f"Detection result: {detection_result}, status code: {status_code}")
-                    # if isinstance(detection_result, tuple) and len(detection_result) == 2:
-                    #     detection_summary, status_code = detection_result
-                    if detection_result.get('status') == 'error':
-                        self.send_text(chat_id, f"Sorry! >_< There was a Detection error: {detection_result['error_message']}")
-                        return
-                    else:
-                        detection_summary, status_code = detection_result, 200
+                    detection_summary, status_code = img.upload_and_detect(image_path, chat_id)
+                    logger.info(f"Detection result: {detection_summary}, Status code: {status_code}")
+
                     if status_code != 200:
                         error_message = detection_summary if isinstance(detection_summary, str) else "An error occurred during detection."
                         logger.warning(f"Sending error message to user: {error_message}")
                         self.send_text(chat_id, error_message)
-                        return
+                        return 200
                     if detection_summary:
                         processed_image_path = detection_summary.get('processed_image_path', [])
                         caption = self.detection_decode(detection_summary)
@@ -194,11 +186,16 @@ class Bot:
                         self.image_path = ""
                     else:
                         self.send_text(chat_id, "No objects detected in the image.")
-                    return
+                        return 200
+                    # Call listen_for_completion to check for job results
+                    chat_id, message = img.listen_for_completion(chat_id)
+                    if message:  # If there's a message to send
+                        self.send_text(chat_id, message)
+                    return 200
                 except Exception as e:
-                    logger.error(f"Error during prediction: {e}", exc_info=True)
+                    logger.error(f"Error during detection: {e}", exc_info=True)
                     self.send_text(chat_id, ">_< Sorry! An unexpected error occurred during detection. Please try again. >_<")
-                    return
+                    return 200
             else:
                 # Invalid filter command
                 self.send_text(chat_id, "Invalid filter command. Please choose from the command menu.")
@@ -214,10 +211,10 @@ class Bot:
         if detection_summary:
             with open(detection_summary['processed_image_path'], 'rb') as photo:
                 try:
-                    # Check the type of prediction_summary and log it
+                    # Check the type of detection_summary and log it
                     logger.info(f"Detection summary type: {type(detection_summary)}")
                     logger.info(f"Detection summary content: {detection_summary}")
-                    # Assuming prediction_summary is a list of dictionaries
+                    # Assuming detection_summary is a list of dictionaries
                     if isinstance(detection_summary, dict) and 'result_path' in detection_summary:
                         result_path = detection_summary['result_path']
                         if 'labels' in result_path:
@@ -226,14 +223,14 @@ class Bot:
                         else:
                             raise KeyError("Missing 'labels' in 'result_path'")
                     else:
-                        raise KeyError("Invalid structure for prediction_summary")
+                        raise KeyError("Invalid structure for detection_summary")
                     quantities = Counter(classes)
-                    response = "Detection Summary:\n"
+                    response = "Detected:\n"
                     response += "\n".join([f"{key.capitalize()} - {value}" for key, value in quantities.items()])
                     return response
                 except (json.JSONDecodeError, KeyError, TypeError) as e:
-                    logger.error(f'Error decoding prediction summary: {e}')
-                    return "Error decoding prediction summary"
+                    logger.error(f'Error decoding detection summary: {e}')
+                    return "Error decoding detection summary"
 
             # TODO upload the photo to S3 """(in img_proc)"""
             # TODO send a job to the SQS queue """(in img_proc)"""

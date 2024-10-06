@@ -7,9 +7,11 @@ import os
 import boto3
 from botocore.exceptions import ClientError
 import json
-from decimal import Decimal
-import decimal
 from typing import Any, Dict
+from bson import ObjectId
+import uuid
+from flask import jsonify
+
 
 # AWS Services
 s3_client = boto3.client('s3')
@@ -21,6 +23,8 @@ bucket_name = os.environ['BUCKET_NAME']
 job_queue_url = os.environ['SQS_JOB_QUEUE_URL']
 completion_queue_url = os.environ['SQS_COMPLETION_QUEUE_URL']
 dynamodb_table_name = dynamodb.Table(os.environ['DYNAMO_DB_NAME'])
+
+detection_results = []
 
 with open("data/coco128.yaml", "r") as stream:
     names = yaml.safe_load(stream)['names']
@@ -36,76 +40,86 @@ with open("data/coco128.yaml", "r") as stream:
 """(Using an SQS notice in the notify_completion & the process_message functions)"""
 
 
-def convert_decimal_to_float(data: Any) -> Any:
-    if isinstance(data, decimal.Decimal):
-        return float(data)
-    elif isinstance(data, dict):
-        return {k: convert_decimal_to_float(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [convert_decimal_to_float(v) for v in data]
-    return data
-
-
-def process_message(message):
-    body = json.loads(message['Body'])
-    job_id = body['JobID']
-    img_name = os.path.basename(body['image_path'])
+def process_message(response):
+    body = json.loads(response['Messages'][0]['Body'])
+    receipt_handle = response['Messages'][0]['ReceiptHandle']
+    img_name = body['image_name']
     chat_id = body['chat_id']
-    receipt_handle = message['ReceiptHandle']
-    logger.info(f'Processing job: {job_id} for image: {img_name}')
+
+    detection_id = str(uuid.uuid4())
+    logger.info(f'Processing job for {chat_id} for image: {img_name}')
+
+    user_img_path = Path(f'images/{img_name}')
     try:
-        user_img_path = Path(f'images/{img_name}')
         download_from_s3(img_name, str(user_img_path))
         run(
             weights='yolov5s.pt',
             data='data/coco128.yaml',
             source=str(user_img_path),
             project='static/data',
-            name=job_id,
+            name=detection_id,
             save_txt=True
         )
-        detection_img_path = Path(f'static/data/{job_id}/{img_name}')
-        processed_img_name = f'{job_id}_{img_name}'
-        detection_image_url = upload_to_s3(str(detection_img_path), processed_img_name)
-        detect_summary_path = Path(f'static/data/{job_id}/labels/{img_name.split(".")[0]}.txt')
+        processed_img_name = f'{detection_id}_{img_name}'
+        processed_img_path = Path(f'static/data/{detection_id}/{img_name}')
+        upload_to_s3(str(processed_img_path), processed_img_name)
+        detect_summary_path = Path(f'static/data/{detection_id}/labels/{img_name.split(".")[0]}.txt')
+        if not detect_summary_path.exists():
+            logger.exception(f'Detection: {detection_id}/{img_name} failed. Detection result not found')
+            return f">_< Sorry! Detection: {detection_id}/{img_name} failed. results not found", 404
         with open(detect_summary_path) as f:
             labels = f.read().splitlines()
             labels = [line.split(' ') for line in labels]
             labels = [{
                 'class': names[int(l[0])],
-                'cx': Decimal(l[1]),
-                'cy': Decimal(l[2]),
-                'width': Decimal(l[3]),
-                'height': Decimal(l[4]),
+                'cx': float(l[1]),
+                'cy': float(l[2]),
+                'width': float(l[3]),
+                'height': float(l[4]),
             } for l in labels]
+
         detection_summary = {
-            'user_img_path': str(user_img_path),
-            'detection_img_path': str(detection_img_path),
-            'detection_image_url': detection_image_url,
+            'JobID': str(detection_id),
+            'Timestamp': int(time.time()),
+            'chat_id': chat_id,
+            # 'user_img_path': str(user_img_path),
+            # 'processed_img_path': str(processed_img_path),
+            'processed_img_name': processed_img_name,
+            # 'detection_image_url': detection_image_url,
             'labels': labels
         }
-        store_detection_in_dynamodb(job_id, detection_summary)
-        notify_completion(job_id, processed_img_name, chat_id)
+
+        db_converted_results = store_detection_in_dynamodb(detection_summary)
+        notify_completion(db_converted_results, processed_img_name, chat_id)
         sqs_client.delete_message(QueueUrl=job_queue_url, ReceiptHandle=receipt_handle)
         logger.info(f'Processed and deleted message: {receipt_handle}')
+
+
     except Exception as e:
         logger.error(f"Error processing message: {e}")
-        notify_error(job_id, chat_id, str(e))
+        notify_error(chat_id, str(e))
         sqs_client.delete_message(QueueUrl=job_queue_url, ReceiptHandle=receipt_handle)
         logger.info(f'Deleted failed message: {receipt_handle}')
 
 
-def store_detection_in_dynamodb(job_id: str, detection_summary: Dict[str, Any]):
+
+def store_detection_in_dynamodb(detection_summary: Dict[str, Any]):
+    table = dynamodb_table_name
     try:
-        table = dynamodb_table_name
-        item = {
-            'JobID': job_id,
-            'Timestamp': int(time.time()),
-            'DetectionSummary': detection_summary
+        detection_id = str(detection_summary['JobID'])
+        detect_sum_dynamo = {
+            'JobID': {'S': detection_id},
+            'Timestamp': {'N': str(detection_summary['Timestamp'])},
+            'chat_id': {'S': str(detection_summary['chat_id'])},
+            # 'user_img_path': {'S': str(detection_summary['user_img_path'])},
+            # 'processed_img_path': {'S': str(detection_summary['processed_img_path'])},
+            'processed_img_name': {'S': str(detection_summary['processed_img_name'])},
+            # 'detection_image_url': {'S': str(detection_summary['detection_image_url'])},
+            'labels': {'L': convert_labels(detection_summary['labels'])}
         }
-        response = table.put_item(Item=item)
-        json_summary = convert_decimal_to_float(detection_summary)
-        logger.info(f"Detection stored in DynamoDB: {json.dumps(json_summary)}")
+        logger.debug(f"Attempting to store in DynamoDB: {json.dumps(detect_sum_dynamo)}")
+        response = table.put_item(Item=detect_sum_dynamo)
+        logger.info(f"Detection stored in DynamoDB: {json.dumps(detection_summary)}")
         logger.debug(f"DynamoDB response: {response}")
     except ClientError as e:
         logger.error(f"Error writing to DynamoDB: {e}")
@@ -115,28 +129,24 @@ def store_detection_in_dynamodb(job_id: str, detection_summary: Dict[str, Any]):
     except Exception as e:
         logger.error(f"Unexpected error writing to DynamoDB: {e}")
         raise
+    converted_data = convert_object_id(detection_summary)
+    return converted_data, 200
 
 
-def notify_completion(job_id, processed_img_name, chat_id):
+def notify_completion(detection_id, processed_img_name, chat_id):
     """Send completion notice to Polybot through SQS."""
     try:
         completion_message = json.dumps({
-            'JobID': job_id,
-            'bucket_name': bucket_name,
+            'JobID': detection_id,
             'image_name': processed_img_name,
             'chat_id': chat_id
         })
+
         sqs_client.send_message(
             QueueUrl=completion_queue_url,
-            MessageBody=completion_message,
-            MessageAttributes={
-                'JobID': {
-                    'StringValue': job_id,
-                    'DataType': 'String'
-                }
-            }
+            MessageBody=completion_message
         )
-        logger.info(f"Sent completion notice for prediction: {job_id}")
+        logger.info(f"Sent completion notice for detection: {detection_id}")
     except ClientError as e:
         logger.error(f"Error sending completion notice: {e}")
         raise
@@ -144,11 +154,8 @@ def notify_completion(job_id, processed_img_name, chat_id):
 def consume_queue():
     while True:
         response = sqs_client.receive_message(QueueUrl=job_queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=20)
-        if 'Messages' not in response:
-            continue
-        for message in response['Messages']:
-            process_message(message)
-
+        if 'Messages' in response:
+            process_message(response)
 
 def download_from_s3(s3_key, local_path):
     s3_key_with_prefix = f"user_images/{s3_key}"
@@ -167,40 +174,51 @@ def upload_to_s3(local_path, s3_key):
     s3_key_with_prefix = f"processed_images/{s3_key}"
     try:
         s3_client.upload_file(local_path, bucket_name, s3_key_with_prefix)
-        image_url = f"https://{bucket_name}.s3.amazonaws.com/{s3_key_with_prefix}"
         logger.info(f'<green>Successfully uploaded {local_path} to s3://{bucket_name}/{s3_key_with_prefix}</green>')
-        return image_url
     except ClientError as e:
         logger.error(f"Error uploading file to S3: {e}")
         raise
 
 
-def notify_error(job_id, chat_id, error_message):
+def notify_error(chat_id, error_message):
     try:
         error_payload = json.dumps({
-            'JobID': job_id,
             'chat_id': chat_id,
             'status': 'error',
             'error_message': error_message
         })
         sqs_client.send_message(
             QueueUrl=completion_queue_url,
-            MessageBody=error_payload,
-            MessageAttributes={
-                'JobID': {
-                    'StringValue': job_id,
-                    'DataType': 'String'
-                },
-                'status': {
-                    'StringValue': 'error',
-                    'DataType': 'String'
-                }
-            }
+            MessageBody=error_payload
         )
-        logger.info(f"Sent error notice for job: {job_id}")
+        logger.info(f"Sent error notice to user: {chat_id}")
     except ClientError as e:
         logger.error(f"Error sending error notice: {e}")
         raise
+
+# Convert the labels array to the DynamoDB format
+def convert_labels(labels):
+    return [
+        {
+            "M": {
+                "class": {"S": label["class"]},
+                "cx": {"N": str(label["cx"])},
+                "cy": {"N": str(label["cy"])},
+                "width": {"N": str(label["width"])},
+                "height": {"N": str(label["height"])}
+            }
+        } for label in labels
+    ]
+
+def convert_object_id(data):
+    if isinstance(data, dict):
+        return {key: convert_object_id(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [convert_object_id(item) for item in data]
+    elif isinstance(data, ObjectId):
+        return str(data)  # Convert ObjectId to string
+    else:
+        return data
 
 
 if __name__ == "__main__":
