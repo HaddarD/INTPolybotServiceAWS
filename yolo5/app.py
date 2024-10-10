@@ -45,8 +45,8 @@ def process_message(response):
     receipt_handle = response['Messages'][0]['ReceiptHandle']
     img_name = body['image_name']
     chat_id = body['chat_id']
+    detection_id = str(body['JobID'])
 
-    detection_id = str(uuid.uuid4())
     logger.info(f'Processing job for {chat_id} for image: {img_name}')
 
     user_img_path = Path(f'images/{img_name}')
@@ -90,14 +90,14 @@ def process_message(response):
         }
 
         db_converted_results = store_detection_in_dynamodb(detection_summary)
-        notify_completion(db_converted_results, processed_img_name, chat_id)
+        notify_completion(detecttion_summary, processed_img_name, chat_id)
         sqs_client.delete_message(QueueUrl=job_queue_url, ReceiptHandle=receipt_handle)
         logger.info(f'Processed and deleted message: {receipt_handle}')
 
 
     except Exception as e:
         logger.error(f"Error processing message: {e}")
-        notify_error(chat_id, str(e))
+        notify_error(detection_id, chat_id, str(e))
         sqs_client.delete_message(QueueUrl=job_queue_url, ReceiptHandle=receipt_handle)
         logger.info(f'Deleted failed message: {receipt_handle}')
 
@@ -133,11 +133,12 @@ def store_detection_in_dynamodb(detection_summary: Dict[str, Any]):
     return converted_data, 200
 
 
-def notify_completion(detection_id, processed_img_name, chat_id):
+def notify_completion(detection_summary, processed_img_name, chat_id):
     """Send completion notice to Polybot through SQS."""
     try:
         completion_message = json.dumps({
             'JobID': detection_id,
+            'Timestamp': str(detection_summary['Timestamp']),
             'image_name': processed_img_name,
             'chat_id': chat_id
         })
@@ -180,9 +181,10 @@ def upload_to_s3(local_path, s3_key):
         raise
 
 
-def notify_error(chat_id, error_message):
+def notify_error(detection_id, chat_id, error_message):
     try:
         error_payload = json.dumps({
+            'JobID': detection_id,
             'chat_id': chat_id,
             'status': 'error',
             'error_message': error_message

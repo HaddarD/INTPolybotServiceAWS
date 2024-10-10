@@ -170,7 +170,8 @@ class Bot:
                 try:
                     self.send_text(chat_id, "Your image is being processed. Please wait...")
                     image_path = os.path.abspath(self.image_path)
-                    detection_summary, status_code = img.upload_and_detect(image_path, chat_id)
+                    detection_id = str(uuid.uuid4())
+                    detection_summary, status_code = img.upload_and_detect(image_path, chat_id, detection_id)
                     logger.info(f"Detection result: {detection_summary}, Status code: {status_code}")
 
                     if status_code != 200:

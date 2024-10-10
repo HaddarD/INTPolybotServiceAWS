@@ -121,7 +121,7 @@ class Img:
         for i, row in enumerate(self.data):
             self.data[i] = [0 if pixel < average else 255 for pixel in row]
 
-    def upload_and_detect(self, image_path, chat_id, image_name=None):
+    def upload_and_detect(self, image_path, chat_id, detection_id, image_name=None):
         """
         Uploads the image to S3 & sends Yolo5 an SQS job request to detect the image content
         """
@@ -137,10 +137,10 @@ class Img:
             raise
         logger.info(f"Starting detection on image: {image_name}")
         # Send job to yolo5 via SQS
-        self.send_job_to_sqs(image_name, chat_id)
+        self.send_job_to_sqs(image_name, chat_id, detection_id)
 
         # Wait for results using polling mechanism
-        results = self.listen_for_completion(chat_id)
+        results = self.listen_for_completion(detection_id)
         if isinstance(results, str) and "TimedOut" in results:
             return results, 500
         if not results:
@@ -160,23 +160,25 @@ class Img:
             logger.error(f"Error uploading file to S3: {e}")
             raise
 
-    def send_job_to_sqs(self, image_name, chat_id):
+    def send_job_to_sqs(self, image_name, chat_id, detection_id):
         message_body = json.dumps({
+            'JobID': str(detection_id),
             'image_name': image_name,
             'chat_id': chat_id
         })
+
         self.sqs_client.send_message(
             QueueUrl=self.job_queue_url,
             MessageBody=message_body,
         )
-        logger.info(f"Job sent to YOLO5 for detection, Chat ID: {chat_id}")
+        logger.info(f"Job sent to YOLO5 for Detection ID: {detection_id}")
 
-    def listen_for_completion(self, chat_id):
+    def listen_for_completion(self, detection_id):
         max_attempts = 3  # Adjust as needed
         attempt = 0
         # Poll SQS for completion messages
         while attempt < max_attempts:
-            logger.info(f"Polling for completion of user: {chat_id}")
+            logger.info(f"Polling for completion for Detection ID: {detection_id}")
             try:
                 response = self.sqs_client.receive_message(
                     QueueUrl=self.completion_queue_url,
@@ -187,7 +189,7 @@ class Img:
                 )
                 logger.debug(f"SQS Response: {response}")
                 if 'Messages' not in response or not response['Messages']:
-                    logger.info(f"No messages received for job from user: {chat_id}, continuing to poll")
+                    logger.info(f"No messages received for Detection ID: {detection_id}, continuing to poll")
                     attempt += 1
                     time.sleep(10)
                     continue
@@ -202,7 +204,7 @@ class Img:
                     # Handle error messages
                     if 'status' in body and body['status'] == 'error':
                         error_message = body.get('error_message', 'An unknown error occurred')
-                        logger.error(f"YOLO5 job for chat_id {chat_id} failed: {error_message}")
+                        logger.error(f"YOLO5 job for Detection ID: {detection_id} failed: {error_message}")
                         self.delete_message(receipt_handle)
                         logger.info(f"Deleted failed detection attempt {message}")
                         return chat_id, f"Sorry! >_< Your job has failed: {error_message}. Please try again."
