@@ -189,9 +189,9 @@ class Bot:
                         self.send_text(chat_id, "No objects detected in the image.")
                         return 200
                     # Call listen_for_completion to check for job results
-                    chat_id, message = img.listen_for_completion(chat_id)
+                    result_chat_id, message = img.listen_for_completion(chat_id)
                     if message:  # If there's a message to send
-                        self.send_text(chat_id, message)
+                        self.send_text(result_chat_id or chat_id, message)
                     return 200
                 except Exception as e:
                     logger.error(f"Error during detection: {e}", exc_info=True)

@@ -11,7 +11,7 @@ from typing import Any, Dict
 from bson import ObjectId
 import uuid
 from flask import jsonify
-
+import decimal
 
 # AWS Services
 s3_client = boto3.client('s3')
@@ -90,7 +90,7 @@ def process_message(response):
         }
 
         db_converted_results = store_detection_in_dynamodb(detection_summary)
-        notify_completion(detecttion_summary, processed_img_name, chat_id)
+        notify_completion(detection_summary, processed_img_name, chat_id)
         sqs_client.delete_message(QueueUrl=job_queue_url, ReceiptHandle=receipt_handle)
         logger.info(f'Processed and deleted message: {receipt_handle}')
 
@@ -102,23 +102,22 @@ def process_message(response):
         logger.info(f'Deleted failed message: {receipt_handle}')
 
 
-
 def store_detection_in_dynamodb(detection_summary: Dict[str, Any]):
     table = dynamodb_table_name
     try:
-        detection_id = str(detection_summary['JobID'])
-        detect_sum_dynamo = {
-            'JobID': {'S': detection_id},
-            'Timestamp': {'N': str(detection_summary['Timestamp'])},
-            'chat_id': {'S': str(detection_summary['chat_id'])},
-            # 'user_img_path': {'S': str(detection_summary['user_img_path'])},
-            # 'processed_img_path': {'S': str(detection_summary['processed_img_path'])},
-            'processed_img_name': {'S': str(detection_summary['processed_img_name'])},
-            # 'detection_image_url': {'S': str(detection_summary['detection_image_url'])},
-            'labels': {'L': convert_labels(detection_summary['labels'])}
-        }
-        logger.debug(f"Attempting to store in DynamoDB: {json.dumps(detect_sum_dynamo)}")
-        response = table.put_item(Item=detect_sum_dynamo)
+        # detection_id = str(detection_summary['JobID'])
+        # detect_sum_dynamo = {
+        #     'JobID': {'S': detection_id},
+        #     'Timestamp': {'N': str(detection_summary['Timestamp'])},
+        #     'chat_id': {'S': str(detection_summary['chat_id'])},
+        #     # 'user_img_path': {'S': str(detection_summary['user_img_path'])},
+        #     # 'processed_img_path': {'S': str(detection_summary['processed_img_path'])},
+        #     'processed_img_name': {'S': str(detection_summary['processed_img_name'])},
+        #     # 'detection_image_url': {'S': str(detection_summary['detection_image_url'])},
+        #     'labels': {'L': convert_labels(detection_summary['labels'])}
+        # }
+        logger.debug(f"Attempting to store in DynamoDB: {json.dumps(detection_summary)}")
+        response = table.put_item(Item=detection_summary)
         logger.info(f"Detection stored in DynamoDB: {json.dumps(detection_summary)}")
         logger.debug(f"DynamoDB response: {response}")
     except ClientError as e:
@@ -129,15 +128,16 @@ def store_detection_in_dynamodb(detection_summary: Dict[str, Any]):
     except Exception as e:
         logger.error(f"Unexpected error writing to DynamoDB: {e}")
         raise
-    converted_data = convert_object_id(detection_summary)
-    return converted_data, 200
+    # converted_data = convert_object_id(detection_summary)
+    # return converted_data, 200
+    return
 
 
 def notify_completion(detection_summary, processed_img_name, chat_id):
     """Send completion notice to Polybot through SQS."""
     try:
         completion_message = json.dumps({
-            'JobID': detection_id,
+            'JobID': str(detection_summary['JobID']),
             'Timestamp': str(detection_summary['Timestamp']),
             'image_name': processed_img_name,
             'chat_id': chat_id
@@ -152,11 +152,13 @@ def notify_completion(detection_summary, processed_img_name, chat_id):
         logger.error(f"Error sending completion notice: {e}")
         raise
 
+
 def consume_queue():
     while True:
         response = sqs_client.receive_message(QueueUrl=job_queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=20)
         if 'Messages' in response:
             process_message(response)
+
 
 def download_from_s3(s3_key, local_path):
     s3_key_with_prefix = f"user_images/{s3_key}"
@@ -170,6 +172,7 @@ def download_from_s3(s3_key, local_path):
     except ClientError as e:
         logger.error(f'<red>Error downloading from S3: {e}</red>')
         raise
+
 
 def upload_to_s3(local_path, s3_key):
     s3_key_with_prefix = f"processed_images/{s3_key}"
@@ -198,32 +201,32 @@ def notify_error(detection_id, chat_id, error_message):
         logger.error(f"Error sending error notice: {e}")
         raise
 
-# Convert the labels array to the DynamoDB format
-def convert_labels(labels):
-    return [
-        {
-            "M": {
-                "class": {"S": label["class"]},
-                "cx": {"N": str(label["cx"])},
-                "cy": {"N": str(label["cy"])},
-                "width": {"N": str(label["width"])},
-                "height": {"N": str(label["height"])}
-            }
-        } for label in labels
-    ]
 
-def convert_object_id(data):
-    if isinstance(data, dict):
-        return {key: convert_object_id(value) for key, value in data.items()}
-    elif isinstance(data, list):
-        return [convert_object_id(item) for item in data]
-    elif isinstance(data, ObjectId):
-        return str(data)  # Convert ObjectId to string
-    else:
-        return data
+# Convert the labels array to the DynamoDB format
+# def convert_labels(labels):
+#     return [
+#         {
+#             "M": {
+#                 "class": {"S": label["class"]},
+#                 "cx": {"N": str(label["cx"])},
+#                 "cy": {"N": str(label["cy"])},
+#                 "width": {"N": str(label["width"])},
+#                 "height": {"N": str(label["height"])}
+#             }
+#         } for label in labels
+#     ]
+#
+#
+# def convert_object_id(data):
+#     if isinstance(data, dict):
+#         return {key: convert_object_id(value) for key, value in data.items()}
+#     elif isinstance(data, list):
+#         return [convert_object_id(item) for item in data]
+#     elif isinstance(data, ObjectId):
+#         return str(data)  # Convert ObjectId to string
+#     else:
+#         return data
 
 
 if __name__ == "__main__":
     consume_queue()
-
-
