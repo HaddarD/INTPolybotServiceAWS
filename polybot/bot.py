@@ -12,6 +12,7 @@ import json
 class Bot:
 
     def __init__(self, token, telegram_chat_url):
+        # self.img = Img()
         self.image_path = ""
         self.images = []
         # create a new instance of the TeleBot class.
@@ -179,20 +180,21 @@ class Bot:
                         logger.warning(f"Sending error message to user: {error_message}")
                         self.send_text(chat_id, error_message)
                         return 200
+
                     if detection_summary:
                         processed_image_path = detection_summary.get('processed_image_path', [])
                         caption = self.detection_decode(detection_summary)
                         self.send_photo(chat_id, processed_image_path, caption)
-                        self.images = []
-                        self.image_path = ""
                     else:
                         self.send_text(chat_id, "No objects detected in the image.")
+                        self.images = []
+                        self.image_path = ""
                         return 200
-                    # Call listen_for_completion to check for job results
-                    result_chat_id, message = img.listen_for_completion(chat_id)
-                    if message:  # If there's a message to send
-                        self.send_text(result_chat_id or chat_id, message)
-                    return 200
+                    # # Call listen_for_completion to check for job results
+                    # result_chat_id, message = img.listen_for_completion(chat_id)
+                    # if message:  # If there's a message to send
+                    #     self.send_text(result_chat_id or chat_id, message)
+                    # return 200
                 except Exception as e:
                     logger.error(f"Error during detection: {e}", exc_info=True)
                     self.send_text(chat_id, ">_< Sorry! An unexpected error occurred during detection. Please try again. >_<")
@@ -236,3 +238,8 @@ class Bot:
             # TODO upload the photo to S3 """(in img_proc)"""
             # TODO send a job to the SQS queue """(in img_proc)"""
             # TODO send message to the Telegram end-user (e.g. Your image is being processed. Please wait...) """(in the handle_filter_command)"""
+
+# img = Img(sqs_client, completion_queue_url, bucket_name)
+# result_checker_thread = threading.Thread(target=img.check_for_results)
+# result_checker_thread.daemon = True
+# result_checker_thread.start()

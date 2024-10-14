@@ -2,8 +2,11 @@ import threading
 import queue
 import json
 import time
+import logging
 from botocore.exceptions import ClientError
 
+
+logger = logging.getLogger(__name__)
 
 class SQSListener:
     def __init__(self, sqs_client, completion_queue_url, bucket_name, message_processor):
@@ -51,6 +54,15 @@ class SQSListener:
             logger.error(f"Failed to parse message body: {message['Body']}")
         except ValueError as ve:
             logger.error(str(ve))
+
+    def delete_message(self, receipt_handle):
+        try:
+            self.sqs_client.delete_message(
+                QueueUrl=self.completion_queue_url,
+                ReceiptHandle=receipt_handle
+            )
+        except ClientError as e:
+            logger.error(f"Failed to delete message: {str(e)}", exc_info=True)
 
     def get_processed_message(self):
         try:
