@@ -8,6 +8,7 @@ from botocore.exceptions import ClientError
 import json
 import time
 from boto3.dynamodb.types import TypeDeserializer
+from sqs_listener import SQSListener
 
 
 def rgb2gray(rgb):
@@ -27,6 +28,7 @@ class Img:
         self.completion_queue_url = os.environ.get('SQS_COMPLETION_QUEUE_URL')
         self.dynamo_client = boto3.resource('dynamodb', region_name='us-east-1')
         self.table = self.dynamo_client.Table('DYNAMO_DB_NAME')
+        self.sqs_listener = SQSListener(self.sqs_client, self.completion_queue_url, self.bucket_name)
 
         if not self.job_queue_url or not self.completion_queue_url:
             raise EnvironmentError("SQS job or completion queue URL not set in environment variables.")
@@ -173,71 +175,124 @@ class Img:
         )
         logger.info(f"Job sent to YOLO5 for Detection ID: {detection_id}")
 
-    def listen_for_completion(self, detection_id):
-        max_attempts = 3  # Adjust as needed
-        attempt = 0
-        # Poll SQS for completion messages
-        while attempt < max_attempts:
-            logger.info(f"Polling for completion for Detection ID: {detection_id}")
-            try:
-                response = self.sqs_client.receive_message(
-                    QueueUrl=self.completion_queue_url,
-                    AttributeNames=['All'],
-                    MessageAttributeNames=['All'],
-                    MaxNumberOfMessages=1,
-                    WaitTimeSeconds=10
-                )
-                logger.debug(f"SQS Response: {response}")
-                if 'Messages' not in response or not response['Messages']:
-                    logger.info(f"No messages received for Detection ID: {detection_id}, continuing to poll")
-                    attempt += 1
-                    time.sleep(10)
-                    continue
+    def listen_for_completion(self):
+        self.sqs_listener.start_listening()
+        # max_attempts = 3  # Adjust as needed
+        # # attempt = 0
+        # # Poll SQS for completion messages
+        # for attempt in range(max_attempts):
+        # # while attempt < max_attempts:
+        #     logger.info(f"Polling for completion for Detection ID: {detection_id}")
+        #     try:
+        #         response = self.sqs_client.receive_message(
+        #             QueueUrl=self.completion_queue_url,
+        #             AttributeNames=['All'],
+        #             MessageAttributeNames=['All'],
+        #             MaxNumberOfMessages=1,
+        #             WaitTimeSeconds=10
+        #         )
+        #         logger.debug(f"SQS Response: {response}")
+        #         if 'Messages' not in response or not response['Messages']:
+        #             logger.info(f"No messages received for Detection ID: {detection_id}, continuing to poll")
+        #             attempt += 1
+        #             time.sleep(10)
+        #             continue
+        #
+        #         message = response['Messages'][0]
+        #         receipt_handle = message['ReceiptHandle']
+        #
+        #         try:
+        #             body = json.loads(message['Body'])
+        #             logger.debug(f"Message body: {body}")
+        #
+        #             # Handle error messages
+        #             if 'status' in body and body['status'] == 'error':
+        #                 error_message = body.get('error_message', 'An unknown error occurred')
+        #                 logger.error(f"YOLO5 job for Detection ID: {detection_id} failed: {error_message}")
+        #                 self.delete_message(receipt_handle)
+        #                 logger.info(f"Deleted failed detection attempt {message}")
+        #                 return chat_id, f"Sorry! >_< Your job has failed: {error_message}. Please try again."
+        #
+        #             # Handle successful completion messages
+        #             detection_id = body.get('JobID')
+        #             chat_id = body.get('chat_id')
+        #             processed_img_name = body.get('processed_img_name')
+        #
+        #             if not all([detection_id, chat_id, processed_img_name]):
+        #                 raise ValueError(f"Missing required fields in message: {body}")
+        #
+        #             results = self.fetch_results_from_dynamodb(detection_id)
+        #             logger.info(f'Completion message received for JobID: {detection_id}')
+        #
+        #             processed_image_path = self.download_processed_image_from_s3(
+        #                 self.bucket_name,
+        #                 processed_img_name,
+        #                 local_path=f"/processed_images/{processed_img_name}"
+        #             )
+        #
+        #             self.delete_message(receipt_handle)
+        #             logger.info(f"Deleted completion message for JobID: {detection_id}")
+        #             return results, processed_image_path
+        #
+        #         if error_condition:
+        #             return chat_id, "Error message"
+        #         return chat_id, "Timeout message"
+        #
+        #         except json.JSONDecodeError:
+        #             logger.error(f"Failed to parse message body: {message['Body']}")
+        #         except ValueError as ve:
+        #             logger.error(str(ve))
+        #     except ClientError as e:
+        #         logger.error(f"Error while polling SQS: {str(e)}", exc_info=True)
+        # logger.warning(f"Job {chat_id} did not complete within the expected time.")
+        # return chat_id, f'Sorry, your Detection TimedOut. >_< Please try again.'  # Return None if timeout occurs
 
-                message = response['Messages'][0]
-                receipt_handle = message['ReceiptHandle']
 
-                try:
-                    body = json.loads(message['Body'])
-                    logger.debug(f"Message body: {body}")
+    def process_message(self, body, receipt_handle):
+        receipt_handle = message['ReceiptHandle']
+        try:
+            body = json.loads(message['Body'])
+            logger.debug(f"Message body: {body}")
 
-                    # Handle error messages
-                    if 'status' in body and body['status'] == 'error':
-                        error_message = body.get('error_message', 'An unknown error occurred')
-                        logger.error(f"YOLO5 job for Detection ID: {detection_id} failed: {error_message}")
-                        self.delete_message(receipt_handle)
-                        logger.info(f"Deleted failed detection attempt {message}")
-                        return chat_id, f"Sorry! >_< Your job has failed: {error_message}. Please try again."
+            # Handle error messages
+            if 'status' in body and body['status'] == 'error':
+                error_message = body.get('error_message', 'An unknown error occurred')
+                logger.error(f"YOLO5 job for Detection ID: {body.get('JobID')} failed: {error_message}")
+                self.delete_message(receipt_handle)
+                logger.info(f"Deleted failed detection attempt {message}")
+                return body.get('chat_id'), f"Sorry! >_< Your job has failed: {error_message}. Please try again."
 
-                    # Handle successful completion messages
-                    detection_id = body.get('JobID')
-                    chat_id = body.get('chat_id')
-                    processed_img_name = body.get('processed_img_name')
+            # Handle successful completion messages
+            detection_id = body.get('JobID')
+            chat_id = body.get('chat_id')
+            processed_img_name = body.get('processed_img_name')
 
-                    if not all([detection_id, chat_id, processed_img_name]):
-                        raise ValueError(f"Missing required fields in message: {body}")
+            if not all([detection_id, chat_id, processed_img_name]):
+                raise ValueError(f"Missing required fields in message: {body}")
 
-                    results = self.fetch_results_from_dynamodb(detection_id)
-                    logger.info(f'Completion message received for JobID: {detection_id}')
+            results = self.fetch_results_from_dynamodb(detection_id)
+            logger.info(f'Completion message received for JobID: {detection_id}')
 
-                    processed_image_path = self.download_processed_image_from_s3(
-                        self.bucket_name,
-                        processed_img_name,
-                        local_path=f"/processed_images/{processed_img_name}"
-                    )
+            processed_image_path = self.download_processed_image_from_s3(
+                self.bucket_name,
+                processed_img_name,
+                local_path=f"/processed_images/{processed_img_name}"
+            )
 
-                    self.delete_message(receipt_handle)
-                    logger.info(f"Deleted completion message for JobID: {detection_id}")
-                    return results, processed_image_path
+            self.delete_message(receipt_handle)
+            logger.info(f"Deleted completion message for JobID: {detection_id}")
+            return chat_id, (results, processed_image_path)
 
-                except json.JSONDecodeError:
-                    logger.error(f"Failed to parse message body: {message['Body']}")
-                except ValueError as ve:
-                    logger.error(str(ve))
-            except ClientError as e:
-                logger.error(f"Error while polling SQS: {str(e)}", exc_info=True)
-        logger.warning(f"Job {chat_id} did not complete within the expected time.")
-        return chat_id, f'Sorry, your Detection TimedOut. >_< Please try again.'  # Return None if timeout occurs
+        except json.JSONDecodeError:
+            logger.error(f"Failed to parse message body: {message['Body']}")
+        except ValueError as ve:
+            logger.error(str(ve))
+        except Exception as e:
+            logger.error(f"Error processing message: {str(e)}", exc_info=True)
+
+        # If we get here, there was an error
+        return None, None
+
 
     def fetch_results_from_dynamodb(self, detection_id):
         try:
@@ -289,3 +344,30 @@ class Img:
             )
         except ClientError as e:
             logger.error(f"Failed to delete message: {str(e)}", exc_info=True)
+
+
+    def main_loop(self):
+        self.listen_for_completion()
+        try:
+            while True:
+                processed_message = self.sqs_listener.get_processed_message()
+                if processed_message:
+                    chat_id, result = processed_message
+                    # Send result to the user with chat_id
+                time.sleep(0.1)  # Small delay to prevent busy-waiting
+        except KeyboardInterrupt:
+            print("Shutting down...")
+        finally:
+            self.sqs_listener.stop_listening()
+
+
+# Usage
+if __name__ == "__main__":
+    # Initialize your SQS client, queue URL, and bucket name
+    sqs_client = ...
+    completion_queue_url = ...
+    bucket_name = ...
+
+    # processor = Img(sqs_client, completion_queue_url, bucket_name)
+    img_processor = Img()
+    img_processor.main_loop()
